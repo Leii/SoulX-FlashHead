@@ -16,8 +16,8 @@ from flash_head.utils.utils import match_and_blend_colors_torch, resize_and_cent
 from flash_head.utils.facecrop import process_image
 
 # compile models to speedup inference
-COMPILE_MODEL = True
-COMPILE_VAE = True
+COMPILE_MODEL = False
+COMPILE_VAE = False
 # use parallel vae to speedup decode/encode, only support WanVAE
 USE_PARALLEL_VAE = True
 
@@ -58,8 +58,8 @@ class FlashHeadPipeline:
         checkpoint_dir,
         model_type,
         wav2vec_dir,
-        device="cuda",
-        param_dtype=torch.bfloat16,
+        device="mps",
+        param_dtype=torch.float32,
         use_usp=False,
         num_timesteps=1000,
         use_timestep_transform=True,
@@ -241,7 +241,7 @@ class FlashHeadPipeline:
                 generator=self.generator)
 
             for i in range(len(self.timesteps)-1):
-                torch.cuda.synchronize()
+                torch.mps.synchronize()
                 start_time = time.time()
 
                 noise[:, :self.latent_motion_frames.shape[1]] = self.latent_motion_frames
@@ -275,38 +275,38 @@ class FlashHeadPipeline:
 
                     noise = (1 - t_i_1) * x_0 + t_i_1 * torch.randn(x_0.size(), dtype=x_0.dtype, device=self.device, generator=self.generator)
 
-                torch.cuda.synchronize()
+                torch.mps.synchronize()
                 end_time = time.time()
                 if self.rank == 0:
                     print(f'[generate] model denoise per step: {end_time - start_time}s')
 
             noise[:, :self.latent_motion_frames.shape[1]] = self.latent_motion_frames
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_decode_time = time.time()
 
             videos = self.vae.decode(noise)
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             end_decode_time = time.time()
             if self.rank == 0:
                 print(f'[generate] decode video frames: {end_decode_time - start_decode_time}s')
         
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
         start_color_correction_time = time.time()
         if self.color_correction_strength > 0.0:
             videos = match_and_blend_colors_torch(videos, self.original_color_reference, self.color_correction_strength)
 
         cond_frame = videos[:, :, -self.motion_frames_num:].to(self.device)
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
         end_color_correction_time = time.time()
         if self.rank == 0:
             print(f'[generate] color correction: {end_color_correction_time - start_color_correction_time}s')
 
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
         start_encode_time = time.time()
         self.latent_motion_frames = self.vae.encode(cond_frame)
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
         end_encode_time = time.time()
         if self.rank == 0:
             print(f'[generate] encode motion frames: {end_encode_time - start_encode_time}s')

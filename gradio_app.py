@@ -221,7 +221,7 @@ def run_inference(
         for chunk_idx, audio_embedding_chunk in enumerate(audio_embedding_chunks_list):
             progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Generating chunk {chunk_idx+1}/{total_chunks}")
             
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_time = time.time()
 
             # inference
@@ -230,7 +230,7 @@ def run_inference(
             if chunk_idx != 0:
                 video = video[motion_frames_num:]
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             end_time = time.time()
             logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s")
             
@@ -261,14 +261,14 @@ def run_inference(
             audio_array = np.array(audio_dq)
             audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_time = time.time()
 
             # inference
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:]
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             end_time = time.time()
             logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s")
 

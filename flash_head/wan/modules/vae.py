@@ -924,7 +924,7 @@ def _video_vae(
     pretrained_path=None,
     z_dim=None,
     device="cpu",
-    dtype=torch.float,
+    dtype=torch.float32,
     **kwargs,
 ):
     """
@@ -956,8 +956,8 @@ class WanVAE:
         self,
         z_dim=16,
         vae_path="cache/vae_step_411000.pth",
-        dtype=torch.float,
-        device="cuda",
+        dtype=torch.float32,
+        device="mps",
         parallel=False,
         use_tiling=False,
         use_2d_split=True,
@@ -1161,7 +1161,7 @@ class WanVAE:
         full_encoded = [torch.empty_like(encoded_chunk) for _ in range(world_size)]
         dist.all_gather(full_encoded, encoded_chunk)
 
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
 
         encoded = torch.cat(full_encoded, dim=split_dim)
 
@@ -1245,7 +1245,7 @@ class WanVAE:
 
         dist.all_gather(full_encoded, encoded_chunk)
 
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
 
         # Reconstruct the full encoded tensor
         encoded_rows = []
@@ -1360,7 +1360,7 @@ class WanVAE:
         full_images = [torch.empty_like(images) for _ in range(world_size)]
         dist.all_gather(full_images, images)
 
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
 
         images = torch.cat(full_images, dim=split_dim + 1)
 
@@ -1436,7 +1436,7 @@ class WanVAE:
 
         dist.all_gather(full_images, images_chunk)
 
-        torch.cuda.synchronize()
+        torch.mps.synchronize()
 
         # Reconstruct the full image tensor
         image_rows = []
@@ -1523,7 +1523,7 @@ class WanVAE:
 
             dist.all_gather(full_images, images_chunk)
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
 
             # Reconstruct the full image tensor
             image_rows = []

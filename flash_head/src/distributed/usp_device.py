@@ -27,9 +27,9 @@ def get_device(ulysses_degree, ring_degree):
         )
 
         device = torch.device(f"cuda:{get_world_group().rank}")
-        torch.cuda.set_device(get_world_group().rank)
+        torch.mps.set_device(get_world_group().rank)
 
         logger.info(f'rank={get_world_group().rank} device={str(device)}')
     else:
-        device = "cuda"
+        device = "mps"
     return device

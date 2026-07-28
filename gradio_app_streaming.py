@@ -200,11 +200,11 @@ def run_inference_streaming(
             audio_dq.extend(human_speech_array.tolist())
             audio_array = np.array(audio_dq)
             audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_time = time.time()
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:]
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             logger.info(f"Infer chunk-{chunk_idx} done, cost time: {time.time() - start_time:.2f}s")
             chunk_frames_np = video.cpu().numpy()
             res_queue.put((chunk_idx, chunk_frames_np))

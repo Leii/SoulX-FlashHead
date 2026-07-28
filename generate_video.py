@@ -141,7 +141,7 @@ def generate(args):
         audio_embedding_chunks_list = [audio_embedding_all[:, i * slice_len: i * slice_len + frame_num].contiguous() for i in range((audio_embedding_all.shape[1]-frame_num) // slice_len)]
 
         for chunk_idx, audio_embedding_chunk in enumerate(audio_embedding_chunks_list):
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_time = time.time()
 
             # inference
@@ -150,7 +150,7 @@ def generate(args):
             if chunk_idx != 0:
                 video = video[motion_frames_num:]
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             end_time = time.time()
             if rank == 0:
                 logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.3f}s")
@@ -175,7 +175,7 @@ def generate(args):
         human_speech_array_slices = human_speech_array_all.reshape(-1, human_speech_array_slice_len)
 
         for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             start_time = time.time()
 
             # streaming encode audio chunks
@@ -187,7 +187,7 @@ def generate(args):
             video = run_pipeline(pipeline, audio_embedding)
             video = video[motion_frames_num:]
 
-            torch.cuda.synchronize()
+            torch.mps.synchronize()
             end_time = time.time()
             if rank == 0:
                 logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.3f}s")

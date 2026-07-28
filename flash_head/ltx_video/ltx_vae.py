@@ -7,7 +7,7 @@ class LtxVAE:
         self,
         pretrained_model_type_or_path,
         dtype = torch.bfloat16,
-        device = "cuda",
+        device = "mps",
     ):
         self.model = CausalVideoAutoencoder.from_pretrained(pretrained_model_type_or_path)
         self.model = self.model.eval().requires_grad_(False).to(device).to(dtype)
