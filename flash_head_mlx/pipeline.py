@@ -1,8 +1,7 @@
 """
 MLX FlashHeadPipeline — end-to-end audio-driven lip-sync video generation.
 
-Uses MLX for diffusion model, PyTorch VAE for encode/decode (VAE architecture
-is complex and runs only once per generation, so performance impact is minimal).
+All model computation (VAE + Diffusion) uses native MLX for fast inference.
 Wav2Vec2 audio encoding uses PyTorch (HuggingFace).
 """
 
@@ -20,45 +19,30 @@ from flash_head_mlx.modules.flash_head_model import (
     load_diffusion_weights,
 )
 
-# PyTorch VAE (used for encode/decode — complex diffusers architecture)
-_torch_vae = None
+# MLX VAE
+_mlx_vae = None
 
 
-def _get_torch_vae(ckpt_dir: str, device: str = "cpu"):
-    """Load the PyTorch LTX VAE (singleton). Uses CPU because MPS Conv3d support is limited."""
-    global _torch_vae
-    if _torch_vae is None:
-        import torch
-        vae_dir = os.path.join(ckpt_dir, "VAE_LTX")
-        from flash_head.ltx_video.ltx_vae import LtxVAE
-        _torch_vae = LtxVAE(
-            pretrained_model_type_or_path=vae_dir,
-            dtype=torch.float32,
-            device=device,
-        )
-        _torch_vae.model.eval()
-        _torch_vae.model.requires_grad_(False)
-    return _torch_vae
+def _get_mlx_vae(ckpt_dir: str):
+    """Load the MLX LTX VAE (singleton)."""
+    global _mlx_vae
+    if _mlx_vae is None:
+        from flash_head_mlx.ltx_vae import LtxVAE
+        vae_safetensors = os.path.join(ckpt_dir, "VAE_LTX", "diffusion_pytorch_model.safetensors")
+        _mlx_vae = LtxVAE(safetensors_path=vae_safetensors)
+    return _mlx_vae
 
 
 def vae_encode(video_mlx: mx.array, ckpt_dir: str) -> mx.array:
-    """Encode video to latent using PyTorch VAE. video: (1,3,T,H,W) NCDHW in [-1,1]."""
-    import torch
-    vae = _get_torch_vae(ckpt_dir)
-    video_pt = torch.from_numpy(np.array(video_mlx))
-    with torch.no_grad():
-        latent_pt = vae.encode(video_pt)  # (128, T_l, H_l, W_l)
-    return mx.array(latent_pt.numpy())
+    """Encode video to latent using MLX VAE. video: (1,3,T,H,W) NCDHW in [-1,1]."""
+    vae = _get_mlx_vae(ckpt_dir)
+    return vae.encode(video_mlx)  # (128, T_l, H_l, W_l)
 
 
 def vae_decode(latent_mlx: mx.array, ckpt_dir: str) -> mx.array:
-    """Decode latent to video using PyTorch VAE. latent: (128,T_l,H_l,W_l). Returns: (1,3,T,H,W)."""
-    import torch
-    vae = _get_torch_vae(ckpt_dir)
-    latent_pt = torch.from_numpy(np.array(latent_mlx))
-    with torch.no_grad():
-        video_pt = vae.decode(latent_pt)  # (1, 3, T, H, W)
-    return mx.array(video_pt.numpy())
+    """Decode latent to video using MLX VAE. latent: (128,T_l,H_l,W_l). Returns: (1,3,T,H,W)."""
+    vae = _get_mlx_vae(ckpt_dir)
+    return vae.decode(latent_mlx)  # (1, 3, T, H, W)
 
 
 def timestep_transform(t: float, shift: float = 5.0, num_timesteps: int = 1000) -> float:
@@ -158,8 +142,8 @@ class FlashHeadPipelineMLX:
         if not self.use_ltx:
             raise NotImplementedError("Only 'lite' model type is supported in MLX")
 
-        # ---- VAE (PyTorch, for encode/decode) ----
-        _get_torch_vae(checkpoint_dir)  # preload
+        # ---- VAE (MLX native) ----
+        _get_mlx_vae(checkpoint_dir)  # preload
 
         # ---- Diffusion Model (MLX) ----
         model_dir = os.path.join(checkpoint_dir, "Model_Lite")
@@ -263,7 +247,7 @@ class FlashHeadPipelineMLX:
 
         if self.use_timestep_transform:
             ts = [timestep_transform(t, shift, self.num_timesteps) for t in ts]
-        self.timesteps = [mx.array([t]) for t in ts]
+        self.timesteps = [mx.array([float(t)]) for t in ts]
 
         # Random number generator (MLX global seed)
         self.seed = seed

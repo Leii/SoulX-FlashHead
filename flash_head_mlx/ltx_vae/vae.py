@@ -1,201 +1,170 @@
 """
-MLX CausalVideoAutoencoder — NHWC internal format for native MLX Conv3d performance.
+MLX CausalVideoAutoencoder — matches diffusers AutoencoderKLLTXVideo exactly.
 
-Channel flow (matching diffusers checkpoint):
-  Encoder: patchify(4x4) → 48ch → 128 → 256 → 512 → 512 → 128(latent)
-  Decoder: 128(latent) → 512 → 512 → 256 → 128 → 48 → unpatchify → 3(RGB)
-
-External API uses NCDHW (PyTorch-compatible), internal uses NHWC for zero-overhead Conv3d.
+Architecture (from safetensors keys):
+  Encoder: patchify(4×4 spatial only) → conv_in(48→128) →
+    [res_x×4 → compress_all → res_x_y(128→256)] →
+    [res_x×3 → compress_all → res_x_y(256→512)] →
+    [res_x×3 → compress_all] →
+    [res_x×3] → [res_x×4 (mid)] →
+    conv_out(512→129) → keep[:128]
+  Decoder: conv_in(128→512) →
+    [res_x×4 (mid)] → [res_x×3] →
+    [res_x×3 → upsample] →
+    [res_x_y(512→256) → res_x×3 → upsample] →
+    [res_x_y(256→128) → res_x×4 → upsample] →
+    conv_out(128→48) → unpatchify → 3 RGB
 """
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
 from flash_head_mlx.ltx_vae.ops import (
-    CausalConv3d, PixelNorm, ResnetBlock3D, AttentionBlock,
-    Upsample3D, Downsample3D,
+    CausalConv3d, PixelNorm, ResnetBlock3D,
+    Downsample3D, DepthToSpaceUpsample,
     patchify_nhwc, unpatchify_nhwc,
     ncdhw_to_nhwc, nhwc_to_ncdhw, pt_to_mlx_conv3d,
 )
 
 
-# =============================================================================
-# Building Blocks (NHWC internal)
-# =============================================================================
-
-class DownBlock3D(nn.Module):
-    """
-    Diffusers down block: ResNets → downsampler → conv_out (channel change).
-
-    IMPORTANT: The channel-doubling conv_out happens AFTER the downsampler,
-    not before. This matches the diffusers safetensors layout where
-    downsampler weights have in_ch == out_ch (no channel change).
-    """
-
-    def __init__(self, in_ch: int, out_ch: int, num_resnets: int,
-                 has_downsample: bool = True, causal: bool = True,
-                 padding_mode: str = "replicate"):
-        super().__init__()
-        self.resnets = [
-            ResnetBlock3D(in_ch, in_ch, causal=causal, spatial_padding_mode=padding_mode)
-            for _ in range(num_resnets)
-        ]
-        # Downsampler operates on in_ch (no channel change)
-        self.downsampler = Downsample3D(in_ch, spatial_padding_mode=padding_mode) if has_downsample else None
-        # Channel change happens after downsampling
-        self.conv_out = (
-            ResnetBlock3D(in_ch, out_ch, causal=causal, spatial_padding_mode=padding_mode)
-            if out_ch != in_ch else None
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        for r in self.resnets:
-            x = r(x)
-        if self.downsampler is not None:
-            x = self.downsampler(x)
-        if self.conv_out is not None:
-            x = self.conv_out(x)
-        return x
-
-
-class UpBlock3D(nn.Module):
-    """Optional channel-halving conv + ResNets + optional nearest-upsample."""
-
-    def __init__(self, in_ch: int, out_ch: int, num_resnets: int,
-                 has_upsample: bool = True, causal: bool = False,
-                 padding_mode: str = "replicate"):
-        super().__init__()
-        self.conv_in = (
-            ResnetBlock3D(in_ch, out_ch, causal=causal, spatial_padding_mode=padding_mode)
-            if in_ch != out_ch else None
-        )
-        res_in = out_ch if in_ch != out_ch else in_ch
-        self.resnets = [
-            ResnetBlock3D(res_in, res_in, causal=causal, spatial_padding_mode=padding_mode)
-            for _ in range(num_resnets)
-        ]
-        self.upsampler = Upsample3D(res_in, spatial_padding_mode=padding_mode) if has_upsample else None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if self.conv_in is not None:
-            x = self.conv_in(x)
-        for r in self.resnets:
-            x = r(x)
-        if self.upsampler is not None:
-            x = self.upsampler(x)
-        return x
-
-
-class MidBlock3D(nn.Module):
-    """ResNets only, no spatial change."""
-
-    def __init__(self, channels: int, num_resnets: int, causal: bool = True,
-                 padding_mode: str = "replicate"):
-        super().__init__()
-        self.resnets = [
-            ResnetBlock3D(channels, channels, causal=causal, spatial_padding_mode=padding_mode)
-            for _ in range(num_resnets)
-        ]
-
-    def __call__(self, x: mx.array) -> mx.array:
-        for r in self.resnets:
-            x = r(x)
-        return x
-
-
-# =============================================================================
-# Encoder (NHWC internal)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Encoder
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class Encoder(nn.Module):
-    def __init__(self, padding_mode: str = "replicate"):
+    def __init__(self):
         super().__init__()
-        # Input after patchify: 3*4*4=48 channels → 128
-        self.conv_in = CausalConv3d(48, 128, kernel_size=3, causal=True,
-                                     spatial_padding_mode=padding_mode)
-        self.down_blocks = [
-            DownBlock3D(128, 256, num_resnets=4, has_downsample=True, causal=True, padding_mode=padding_mode),
-            DownBlock3D(256, 512, num_resnets=3, has_downsample=True, causal=True, padding_mode=padding_mode),
-            DownBlock3D(512, 512, num_resnets=3, has_downsample=True, causal=True, padding_mode=padding_mode),
-            DownBlock3D(512, 512, num_resnets=3, has_downsample=False, causal=True, padding_mode=padding_mode),
-        ]
-        self.mid_block = MidBlock3D(512, num_resnets=4, causal=True, padding_mode=padding_mode)
+        pm = "zeros"  # spatial_padding_mode
+
+        # Patchify 4×4 spatial → 48 ch (in forward)
+        self.conv_in = CausalConv3d(48, 128, 3, causal=True, spatial_padding_mode=pm)
+
+        # Block 0: res_x×4 → compress_all → res_x_y(128→256)
+        self.down_0_res = [ResnetBlock3D(128, 128, causal=True, spatial_padding_mode=pm) for _ in range(4)]
+        self.down_0_ds = Downsample3D(128, spatial_padding_mode=pm)
+        self.down_0_xy = ResnetBlock3D(128, 256, causal=True, spatial_padding_mode=pm)
+
+        # Block 1: res_x×3 → compress_all → res_x_y(256→512)
+        self.down_1_res = [ResnetBlock3D(256, 256, causal=True, spatial_padding_mode=pm) for _ in range(3)]
+        self.down_1_ds = Downsample3D(256, spatial_padding_mode=pm)
+        self.down_1_xy = ResnetBlock3D(256, 512, causal=True, spatial_padding_mode=pm)
+
+        # Block 2: res_x×3 → compress_all (no channel change)
+        self.down_2_res = [ResnetBlock3D(512, 512, causal=True, spatial_padding_mode=pm) for _ in range(3)]
+        self.down_2_ds = Downsample3D(512, spatial_padding_mode=pm)
+
+        # Block 3: res_x×3 (no downsample)
+        self.down_3_res = [ResnetBlock3D(512, 512, causal=True, spatial_padding_mode=pm) for _ in range(3)]
+
+        # Mid: res_x×4
+        self.mid_res = [ResnetBlock3D(512, 512, causal=True, spatial_padding_mode=pm) for _ in range(4)]
+
         self.norm_out = PixelNorm()
         self.act_out = nn.SiLU()
-        # 128 latent + 1 log-var = 129 output channels
-        self.conv_out = CausalConv3d(512, 129, kernel_size=3, causal=True,
-                                      spatial_padding_mode=padding_mode)
+        self.conv_out = CausalConv3d(512, 129, 3, causal=True, spatial_padding_mode=pm)
 
     def __call__(self, x_ncdhw: mx.array) -> mx.array:
-        """
-        x_ncdhw: (N, C, T, H, W) PyTorch format
-        Returns: (N, 128, T', H', W') NCDHW
-        """
-        # Convert to NHWC and patchify
-        x = ncdhw_to_nhwc(x_ncdhw)               # (N, T, H, W, C)
-        x = patchify_nhwc(x, patch_size=4)        # (N, T, H/4, W/4, C*16)
-
+        x = ncdhw_to_nhwc(x_ncdhw)
+        x = patchify_nhwc(x, patch_size=4)
         x = self.conv_in(x)
-        for block in self.down_blocks:
-            x = block(x)
-        x = self.mid_block(x)
+
+        for r in self.down_0_res: x = r(x)
+        x = self.down_0_ds(x)
+        x = self.down_0_xy(x)
+
+        for r in self.down_1_res: x = r(x)
+        x = self.down_1_ds(x)
+        x = self.down_1_xy(x)
+
+        for r in self.down_2_res: x = r(x)
+        x = self.down_2_ds(x)
+
+        for r in self.down_3_res: x = r(x)
+        for r in self.mid_res: x = r(x)
+
         x = self.norm_out(x)
         x = self.act_out(x)
         x = self.conv_out(x)
-
-        # Keep only latent channels (drop log-var), convert back to NCDHW
-        x = x[:, :, :, :, :128]                    # (N, T, H, W, 128)
-        return nhwc_to_ncdhw(x)                    # (N, 128, T, H, W)
+        x = x[:, :, :, :, :128]  # drop log-var
+        return nhwc_to_ncdhw(x)
 
 
-# =============================================================================
-# Decoder (NHWC internal)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Decoder
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class Decoder(nn.Module):
-    def __init__(self, padding_mode: str = "replicate"):
+    def __init__(self):
         super().__init__()
-        self.conv_in = CausalConv3d(128, 512, kernel_size=3, causal=False,
-                                     spatial_padding_mode=padding_mode)
-        self.mid_block = MidBlock3D(512, num_resnets=4, causal=False, padding_mode=padding_mode)
-        self.up_blocks = [
-            UpBlock3D(512, 512, num_resnets=3, has_upsample=False, causal=False, padding_mode=padding_mode),
-            UpBlock3D(512, 512, num_resnets=3, has_upsample=True,  causal=False, padding_mode=padding_mode),
-            UpBlock3D(512, 256, num_resnets=3, has_upsample=True,  causal=False, padding_mode=padding_mode),
-            UpBlock3D(256, 128, num_resnets=4, has_upsample=True,  causal=False, padding_mode=padding_mode),
-        ]
+        pm = "zeros"
+
+        self.conv_in = CausalConv3d(128, 512, 3, causal=False, spatial_padding_mode=pm)
+
+        # Mid: res_x×4
+        self.mid_res = [ResnetBlock3D(512, 512, causal=False, spatial_padding_mode=pm) for _ in range(4)]
+
+        # Up 0: res_x×3 (no upsampler)
+        self.up_0_res = [ResnetBlock3D(512, 512, causal=False, spatial_padding_mode=pm) for _ in range(3)]
+
+        # Up 1: res_x×3 → upsample
+        self.up_1_res = [ResnetBlock3D(512, 512, causal=False, spatial_padding_mode=pm) for _ in range(3)]
+        self.up_1_us = DepthToSpaceUpsample(512, causal=False, spatial_padding_mode=pm)
+
+        # Up 2: res_x_y(512→256) → res_x×3 → upsample
+        self.up_2_xy = ResnetBlock3D(512, 256, causal=False, spatial_padding_mode=pm)
+        self.up_2_res = [ResnetBlock3D(256, 256, causal=False, spatial_padding_mode=pm) for _ in range(3)]
+        self.up_2_us = DepthToSpaceUpsample(256, causal=False, spatial_padding_mode=pm)
+
+        # Up 3: res_x_y(256→128) → res_x×4 → upsample
+        self.up_3_xy = ResnetBlock3D(256, 128, causal=False, spatial_padding_mode=pm)
+        self.up_3_res = [ResnetBlock3D(128, 128, causal=False, spatial_padding_mode=pm) for _ in range(4)]
+        self.up_3_us = DepthToSpaceUpsample(128, causal=False, spatial_padding_mode=pm)
+
         self.norm_out = PixelNorm()
         self.act_out = nn.SiLU()
-        # 3*4*4=48 output channels → unpatchify → 3 RGB
-        self.conv_out = CausalConv3d(128, 48, kernel_size=3, causal=False,
-                                      spatial_padding_mode=padding_mode)
+        self.conv_out = CausalConv3d(128, 48, 3, causal=False, spatial_padding_mode=pm)
 
-    def __call__(self, x_ncdhw: mx.array, target_shape: Tuple[int, ...]) -> mx.array:
-        """
-        x_ncdhw: (N, C, T', H', W') PyTorch format
-        Returns: (N, C_out, T, H, W) NCDHW, cropped to target_shape
-        """
-        x = ncdhw_to_nhwc(x_ncdhw)                # (N, T, H, W, C)
+    def __call__(self, x_ncdhw: mx.array, target_shape: Optional[Tuple[int, ...]] = None) -> mx.array:
+        """PT decoder order: mid → res3 → US → res3 → xy → US → res3 → xy → US → res4"""
+        x = ncdhw_to_nhwc(x_ncdhw)
         x = self.conv_in(x)
-        x = self.mid_block(x)
-        for block in self.up_blocks:
-            x = block(x)
+
+        # Mid + first res group (512→512)
+        for r in self.mid_res: x = r(x)
+        for r in self.up_0_res: x = r(x)
+
+        # First upsample, then res group at 512
+        x = self.up_1_us(x)
+        for r in self.up_1_res: x = r(x)
+
+        # res_x_y 512→256, second upsample, then res group at 256
+        x = self.up_2_xy(x)
+        x = self.up_2_us(x)
+        for r in self.up_2_res: x = r(x)
+
+        # res_x_y 256→128, third upsample, then res group at 128
+        x = self.up_3_xy(x)
+        x = self.up_3_us(x)
+        for r in self.up_3_res: x = r(x)
+
         x = self.norm_out(x)
         x = self.act_out(x)
         x = self.conv_out(x)
 
-        x = unpatchify_nhwc(x, patch_size=4, out_channels=3)  # (N, T', H', W', 3)
-        x = nhwc_to_ncdhw(x)                                   # (N, 3, T', H', W')
+        x = unpatchify_nhwc(x, patch_size=4, out_channels=3)
+        x = nhwc_to_ncdhw(x)
 
-        # Crop to target
-        _, _, T_tgt, H_tgt, W_tgt = target_shape
-        return x[:, :, :T_tgt, :H_tgt, :W_tgt]
+        # Crop to target if specified (otherwise return full output, matching PT behavior)
+        if target_shape is not None:
+            _, _, T_tgt, H_tgt, W_tgt = target_shape
+            return x[:, :, :T_tgt, :H_tgt, :W_tgt]
+        return x
 
 
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 # Full VAE
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class CausalVideoAutoencoder(nn.Module):
     def __init__(self):
@@ -206,159 +175,211 @@ class CausalVideoAutoencoder(nn.Module):
         self.std_of_means = mx.ones((128,))
 
     def encode(self, x_ncdhw: mx.array) -> mx.array:
-        """(1, 3, T, H, W) NCDHW → normalized latent (128, T_l, H_l, W_l)"""
-        latent = self.encoder(x_ncdhw)[0]  # (128, T_l, H_l, W_l)
+        latent = self.encoder(x_ncdhw)[0]
         mean = mx.reshape(self.mean_of_means, (-1, 1, 1, 1))
         std = mx.reshape(self.std_of_means, (-1, 1, 1, 1))
         return (latent - mean) / std
 
     def decode(self, z: mx.array, target_shape: Optional[Tuple[int, ...]] = None) -> mx.array:
-        """(128, T_l, H_l, W_l) → (1, 3, T, H, W) NCDHW in [-1, 1]"""
         mean = mx.reshape(self.mean_of_means, (-1, 1, 1, 1))
         std = mx.reshape(self.std_of_means, (-1, 1, 1, 1))
         z = z * std + mean
-        z = mx.expand_dims(z, 0)  # add batch dim
-
+        z = mx.expand_dims(z, 0)
         if target_shape is None:
             _, _, T_l, H_l, W_l = z.shape
-            # LTX VAE: 8x temporal (3 downsamplers), 32x spatial (patchify 4x + 3 downsamplers)
             target_shape = (1, 3, (T_l - 1) * 8 + 1, H_l * 32, W_l * 32)
-
         return self.decoder(z, target_shape)
 
 
-# =============================================================================
-# Weight Loader
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Weight Loader — maps diffusers key paths to MLX model attributes
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def load_weights_from_safetensors(model: CausalVideoAutoencoder, path: str):
-    """Load diffusers-format safetensors into NHWC-native MLX model."""
+    """Load diffusers-format safetensors into MLX VAE."""
     import safetensors
 
     with safetensors.safe_open(path, framework="np") as f:
         keys = sorted(f.keys())
 
-    loaded_count = 0
+    loaded = 0
+    skipped = []
+
     with safetensors.safe_open(path, framework="np") as f:
         for key in keys:
             weight = mx.array(f.get_tensor(key))
-
-            # Convert Conv3d weights: PT (out,in,T,H,W) → MLX (out,T,H,W,in)
             if weight.ndim == 5 and 'weight' in key:
                 weight = pt_to_mlx_conv3d(weight)
-
             if _set_weight(model, key, weight):
-                loaded_count += 1
+                loaded += 1
+            else:
+                skipped.append(key)
 
-    # Statistics
+    # Latent statistics
     with safetensors.safe_open(path, framework="np") as f:
         if 'latents_mean' in f.keys():
             model.mean_of_means = mx.array(f.get_tensor('latents_mean'))
         if 'latents_std' in f.keys():
             model.std_of_means = mx.array(f.get_tensor('latents_std'))
 
-    print(f'Loaded {loaded_count}/{len(keys)} weight tensors from {path}')
+    print(f'Loaded {loaded}/{len(keys)} weight tensors from {path}')
+    if skipped:
+        print(f'  (skipped {len(skipped)}): {skipped}')
 
 
 def _set_weight(model, key: str, weight: mx.array) -> bool:
-    """Set a single weight by diffusers key path. Returns True if set successfully."""
+    """
+    Navigate diffusers key path → MLX model attribute, then set weight.
+
+    Handles key patterns like:
+      encoder.down_blocks.0.resnets.1.conv1.conv.weight
+      encoder.down_blocks.0.downsamplers.0.conv.weight
+      encoder.down_blocks.0.conv_out.conv_shortcut.conv.weight
+      decoder.up_blocks.2.conv_in.norm3.bias
+      decoder.up_blocks.1.upsamplers.0.conv.conv.weight
+    """
     parts = key.split('.')
 
-    # Navigate to the target sub-module
-    if parts[0] == 'encoder':
-        obj = model.encoder
-    elif parts[0] == 'decoder':
-        obj = model.decoder
-    else:
-        return False  # statistics keys
+    # Determine encoder vs decoder
+    is_enc = parts[0] == 'encoder'
+    is_dec = parts[0] == 'decoder'
+    if not (is_enc or is_dec):
+        return False  # latents_mean, latents_std
 
-    idx = 1
-    while idx < len(parts):
-        p = parts[idx]
+    enc = model.encoder if is_enc else None
+    dec = model.decoder if is_dec else None
+    comp = enc if is_enc else dec
 
-        if p in ('conv_in', 'conv_out', 'mid_block', 'norm_out', 'upsampler', 'downsampler'):
-            obj = getattr(obj, p)
-            idx += 1
-        elif p in ('down_blocks', 'up_blocks'):
-            blk_idx = int(parts[idx + 1])
-            lst = getattr(obj, p)
-            obj = lst[blk_idx]
-            idx += 2
-        elif p == 'resnets':
-            r_idx = int(parts[idx + 1])
-            obj = obj.resnets[r_idx]
-            idx += 2
-        elif p == 'downsamplers':
-            # diffusers downsamplers.0.conv → our downsampler.conv
-            obj = obj.downsampler
-            idx += 1  # skip '0'
-        elif p == 'upsamplers':
-            obj = obj.upsampler
-            idx += 1  # skip '0'
-        elif p == 'conv1':
-            obj = obj.conv1
-            idx += 1
-        elif p == 'conv2':
-            obj = obj.conv2
-            idx += 1
-        elif p == 'conv_shortcut':
-            obj = obj.conv_shortcut
-            idx += 1
-        elif p == 'norm3':
-            # LayerNorm in shortcut path: has weight and bias
-            param_name = parts[idx + 1]
-            if hasattr(obj, 'norm3') and hasattr(obj.norm3, param_name):
-                setattr(obj.norm3, param_name, weight)
-                return True
-            return False
-        elif p == 'conv':
-            # Handle conv.weight, conv.bias, or nested conv.conv.weight
-            next_p = parts[idx + 1] if idx + 1 < len(parts) else None
+    # ── BLOCK INDEX MAPPING ──
+    # Diffusers → our names for encoder down_blocks
+    ENC_DOWN_MAP = {
+        0: ('down_0_res', 4, 'down_0_ds', 'down_0_xy'),
+        1: ('down_1_res', 3, 'down_1_ds', 'down_1_xy'),
+        2: ('down_2_res', 3, 'down_2_ds', None),       # no conv_out
+        3: ('down_3_res', 3, None, None),               # no downsample
+    }
+    # Diffusers → our names for decoder up_blocks
+    # Format: (res_name, res_count, [us_name]) or (xy_name, res_name, res_count, us_name)
+    DEC_UP_MAP = {
+        0: {'res_name': 'up_0_res', 'res_count': 3, 'us_name': None},
+        1: {'res_name': 'up_1_res', 'res_count': 3, 'us_name': 'up_1_us'},
+        2: {'xy_name': 'up_2_xy', 'res_name': 'up_2_res', 'res_count': 3, 'us_name': 'up_2_us'},
+        3: {'xy_name': 'up_3_xy', 'res_name': 'up_3_res', 'res_count': 4, 'us_name': 'up_3_us'},
+    }
 
-            if next_p == 'conv':
-                # Double-nested: upsampler.conv.conv.weight → drill through CausalConv3d
-                if hasattr(obj, 'conv'):
-                    inner = obj.conv  # CausalConv3d
-                    if hasattr(inner, 'conv'):
-                        inner = inner.conv  # nn.Conv3d
-                    param_name = parts[idx + 2]  # 'weight' or 'bias'
-                    if hasattr(inner, param_name):
-                        setattr(inner, param_name, weight)
-                        return True
-                return False
+    # ── Parse key path ──
+    idx = 1  # skip 'encoder'/'decoder'
 
-            # Single conv: param_name is 'weight' or 'bias'
-            param_name = next_p
-            if hasattr(obj, 'conv'):
-                inner = obj.conv
-                # Drill through CausalConv3d wrapper if needed
-                if hasattr(inner, 'conv') and isinstance(inner.conv, nn.Conv3d):
-                    inner = inner.conv
-                if hasattr(inner, param_name):
-                    setattr(inner, param_name, weight)
-                    return True
-            return False
-        elif p in ('weight', 'bias'):
-            if hasattr(obj, p):
-                setattr(obj, p, weight)
-                return True
-            # Try obj.conv.weight
-            if hasattr(obj, 'conv') and hasattr(obj.conv, p):
-                setattr(obj.conv, p, weight)
-                return True
-            return False
+    # conv_in / conv_out at top level
+    if parts[idx] in ('conv_in', 'conv_out'):
+        obj = getattr(comp, parts[idx])  # CausalConv3d
+        # Next should be 'conv', then 'weight'/'bias'
+        return _set_conv_weight(obj, parts, idx + 1, weight)
+
+    # mid_block
+    if parts[idx] == 'mid_block':
+        # mid_block.resnets.N.conv1.conv.weight
+        idx += 2  # skip 'mid_block.resnets'
+        res_idx = int(parts[idx]); idx += 1
+        obj = comp.mid_res[res_idx]
+        return _set_resnet_weight(obj, parts, idx, weight)
+
+    # down_blocks / up_blocks
+    if parts[idx] in ('down_blocks', 'up_blocks'):
+        blk_idx = int(parts[idx + 1]); idx += 2
+
+        if is_enc:
+            res_name, res_count, ds_name, xy_name = ENC_DOWN_MAP[blk_idx]
         else:
+            # Decoder up_blocks have different structure per index
+            mapping = DEC_UP_MAP[blk_idx]
+
+        # What sub-section of the block?
+        section = parts[idx]  # 'resnets', 'downsamplers', 'upsamplers', 'conv_out', 'conv_in'
+
+        if section == 'resnets':
             idx += 1
+            res_idx = int(parts[idx]); idx += 1
+            if is_enc:
+                obj = getattr(comp, res_name)[res_idx]
+            else:
+                obj = getattr(comp, mapping['res_name'])[res_idx]
+            return _set_resnet_weight(obj, parts, idx, weight)
+
+        elif section == 'downsamplers':
+            idx += 2
+            obj = getattr(comp, ds_name)
+            return _set_conv_weight(obj.conv, parts, idx, weight)
+
+        elif section == 'upsamplers':
+            idx += 2
+            obj = getattr(comp, mapping['us_name'])
+            return _set_conv_weight(obj.conv, parts, idx, weight)
+
+        elif section == 'conv_out':
+            idx += 1
+            obj = getattr(comp, xy_name)
+            return _set_resnet_weight(obj, parts, idx, weight)
+
+        elif section == 'conv_in':
+            idx += 1
+            obj = getattr(comp, mapping['xy_name'])
+            return _set_resnet_weight(obj, parts, idx, weight)
 
     return False
 
 
-# =============================================================================
-# Public API (NCDHW external, compatible with PyTorch LtxVAE)
-# =============================================================================
+def _set_resnet_weight(obj, parts, idx, weight):
+    """Set weight on ResnetBlock3D sub-module. parts[idx] is conv1/conv2/conv_shortcut/norm3."""
+    sub = parts[idx]
+    if sub == 'conv1':
+        return _set_conv_weight(obj.conv1, parts, idx + 1, weight)
+    elif sub == 'conv2':
+        return _set_conv_weight(obj.conv2, parts, idx + 1, weight)
+    elif sub == 'conv_shortcut':
+        # PlainConv3d — obj.conv_shortcut.conv is nn.Conv3d
+        return _set_conv_weight(obj.conv_shortcut, parts, idx + 1, weight)
+    elif sub == 'norm3':
+        param = parts[idx + 1]  # 'weight' or 'bias'
+        setattr(obj.norm3, param, weight)
+        return True
+    return False
+
+
+def _set_conv_weight(obj, parts, idx, weight):
+    """
+    Set weight on an nn.Conv3d. Handles key paths like:
+      conv.weight           (1 'conv' level)
+      conv.conv.weight      (2 'conv' levels — upsampler)
+    Navigates through CausalConv3d/PlainConv3d wrappers to inner nn.Conv3d.
+    """
+    # Skip 'conv' parts — there may be 1 or 2 levels
+    while idx < len(parts) and parts[idx] == 'conv':
+        # Drill through wrapper to inner conv
+        if hasattr(obj, 'conv') and isinstance(obj.conv, nn.Conv3d):
+            obj = obj.conv
+        idx += 1
+
+    # One more drill-through after skipping all 'conv' parts
+    if hasattr(obj, 'conv') and isinstance(obj.conv, nn.Conv3d):
+        obj = obj.conv
+
+    p = parts[idx] if idx < len(parts) else None
+    if p == 'weight':
+        obj.weight = weight
+        return True
+    elif p == 'bias':
+        obj.bias = weight
+        return True
+    return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class LtxVAE:
-    """MLX VAE — same API as PyTorch flash_head.ltx_video.ltx_vae.LtxVAE."""
+    """MLX VAE — same API as PyTorch version."""
 
     def __init__(self, safetensors_path: str = None):
         self.model = CausalVideoAutoencoder()
@@ -366,9 +387,7 @@ class LtxVAE:
             load_weights_from_safetensors(self.model, safetensors_path)
 
     def encode(self, video: mx.array) -> mx.array:
-        """video: (1, 3, T, H, W) NCDHW in [-1,1] → latent: (128, T_l, H_l, W_l)"""
         return self.model.encode(video)
 
     def decode(self, zs: mx.array) -> mx.array:
-        """zs: (128, T_l, H_l, W_l) → video: (1, 3, T, H, W) NCDHW in [-1,1]"""
         return self.model.decode(zs)

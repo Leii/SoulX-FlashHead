@@ -1,9 +1,7 @@
 """
 MLX custom operations for LTX VAE — NHWC (channels-last) internal format.
 
-MLX uses channels-last for Conv3d: input (N, T, H, W, C), weight (C_out, kT, kH, kW, C_in).
-This module keeps ALL internal tensors in NHWC format for zero-overhead Conv3d calls.
-Only the external API (encode/decode) converts to/from PyTorch's NCDHW format.
+Matches PyTorch diffusers AutoencoderKLLTXVideo / CausalVideoAutoencoder exactly.
 """
 
 import math
@@ -12,45 +10,48 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
-# =============================================================================
-# Format conversion (for external API boundary only)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Format conversion
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def ncdhw_to_nhwc(x: mx.array) -> mx.array:
-    """PyTorch (N,C,T,H,W) → MLX internal (N,T,H,W,C)."""
+    """PyTorch (N,C,T,H,W) → MLX (N,T,H,W,C)."""
     return mx.transpose(x, (0, 2, 3, 4, 1))
 
 
 def nhwc_to_ncdhw(x: mx.array) -> mx.array:
-    """MLX internal (N,T,H,W,C) → PyTorch (N,C,T,H,W)."""
+    """MLX (N,T,H,W,C) → PyTorch (N,C,T,H,W)."""
     return mx.transpose(x, (0, 4, 1, 2, 3))
 
 
-# =============================================================================
-# Normalization
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# PixelNorm
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class PixelNorm(nn.Module):
-    """Channel-wise L2 norm. Channel is last dim in NHWC."""
+    """Channel-wise L2 norm (NHWC, dim=-1). No learnable parameters."""
     def __init__(self, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (N, T, H, W, C) — channel is dim=-1
         return x / mx.sqrt(mx.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
 
 
-# =============================================================================
-# CausalConv3d (NHWC native)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# CausalConv3d (NHWC native) — matches PT CausalConv3d exactly
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class CausalConv3d(nn.Module):
     """
-    3D convolution with causal temporal padding, NHWC native.
+    PT CausalConv3d forward:
+      if causal:  replicate first frame (kT-1) times, prepend
+      else:       replicate first/last frame (kT-1)//2 times, prepend/append
+      spatial:    Conv3d handles padding=(0, h_pad, w_pad) with padding_mode
 
-    MLX Conv3d expects: input (N, T, H, W, C_in), weight (C_out, kT, kH, kW, C_in).
-    No transpose overhead — everything stays in NHWC.
+    MLX: we pad everything manually, then call Conv3d with padding=0.
+    Temporal padding is ALWAYS replicate (matching PT). Spatial padding
+    is zeros or replicate per spatial_padding_mode.
     """
 
     def __init__(
@@ -63,7 +64,8 @@ class CausalConv3d(nn.Module):
         spatial_padding_mode: str = "zeros",
     ):
         super().__init__()
-        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride=stride, padding=0)
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size,
+                              stride=stride, padding=0)
         self.kernel_size = kernel_size
         self.causal = causal
         self.spatial_padding_mode = spatial_padding_mode
@@ -72,36 +74,72 @@ class CausalConv3d(nn.Module):
         """Pad NHWC tensor: (N, T, H, W, C)."""
         kT = kH = kW = self.kernel_size
 
+        # Temporal padding: ALWAYS replicate (matching PT CausalConv3d)
         if self.causal:
             pad_t_l, pad_t_r = kT - 1, 0
         else:
             pad_t_l = pad_t_r = kT // 2
 
+        if pad_t_l > 0:
+            x = mx.concatenate([mx.repeat(x[:, :1], pad_t_l, axis=1), x], axis=1)
+        if pad_t_r > 0:
+            x = mx.concatenate([x, mx.repeat(x[:, -1:], pad_t_r, axis=1)], axis=1)
+
+        # Spatial padding
         pad_h = kH // 2
         pad_w = kW // 2
 
         if self.spatial_padding_mode == "replicate":
-            if pad_t_l > 0:
-                x = mx.concatenate([mx.repeat(x[:, :1], pad_t_l, axis=1), x], axis=1)
-            if pad_t_r > 0:
-                x = mx.concatenate([x, mx.repeat(x[:, -1:], pad_t_r, axis=1)], axis=1)
             if pad_h > 0:
-                x = mx.concatenate([mx.repeat(x[:, :, :1], pad_h, axis=2), x, mx.repeat(x[:, :, -1:], pad_h, axis=2)], axis=2)
+                x = mx.concatenate([
+                    mx.repeat(x[:, :, :1], pad_h, axis=2),
+                    x,
+                    mx.repeat(x[:, :, -1:], pad_h, axis=2),
+                ], axis=2)
             if pad_w > 0:
-                x = mx.concatenate([mx.repeat(x[:, :, :, :1], pad_w, axis=3), x, mx.repeat(x[:, :, :, -1:], pad_w, axis=3)], axis=3)
+                x = mx.concatenate([
+                    mx.repeat(x[:, :, :, :1], pad_w, axis=3),
+                    x,
+                    mx.repeat(x[:, :, :, -1:], pad_w, axis=3),
+                ], axis=3)
         else:
+            # Zero padding
             x = mx.pad(x, [
-                (0, 0),
-                (pad_t_l, pad_t_r),
-                (pad_h, pad_h),
-                (pad_w, pad_w),
-                (0, 0),
+                (0, 0), (0, 0), (pad_h, pad_h), (pad_w, pad_w), (0, 0),
             ])
         return x
 
     def __call__(self, x: mx.array) -> mx.array:
-        # x: (N, T, H, W, C) — NHWC native, no transpose needed!
-        x = self._pad(x)
+        return self.conv(self._pad(x))
+
+    @property
+    def weight(self):
+        return self.conv.weight
+
+    @weight.setter
+    def weight(self, value):
+        self.conv.weight = value
+
+    @property
+    def bias(self):
+        return self.conv.bias
+
+    @bias.setter
+    def bias(self, value):
+        self.conv.bias = value
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Plain Conv3d 1×1×1 (for conv_shortcut in ResnetBlock3D)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PlainConv3d(nn.Module):
+    """1×1×1 Conv3d — no padding, no causal. Used for resnet shortcuts (make_linear_nd)."""
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size=1, stride=1, padding=0)
+
+    def __call__(self, x: mx.array) -> mx.array:
         return self.conv(x)
 
     @property
@@ -121,15 +159,21 @@ class CausalConv3d(nn.Module):
         self.conv.bias = value
 
 
-# =============================================================================
-# ResNet Block
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# ResnetBlock3D (matched to PT)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ResnetBlock3D(nn.Module):
-    """3D ResNet — NHWC native."""
+    """
+    PT ResnetBlock3D forward:
+      h = norm1(x) → SiLU → conv1(h, causal)
+      h = norm2(h) → SiLU → dropout → conv2(h, causal)
+      shortcut = norm3(x) → conv_shortcut(x)   [only if in_ch != out_ch]
+      out = shortcut + h
+    """
 
     def __init__(self, in_channels: int, out_channels: int,
-                 causal: bool = True, spatial_padding_mode: str = "replicate"):
+                 causal: bool = True, spatial_padding_mode: str = "zeros"):
         super().__init__()
         self.norm1 = PixelNorm()
         self.norm2 = PixelNorm()
@@ -138,11 +182,11 @@ class ResnetBlock3D(nn.Module):
                                    causal=causal, spatial_padding_mode=spatial_padding_mode)
         self.conv2 = CausalConv3d(out_channels, out_channels, kernel_size=3,
                                    causal=causal, spatial_padding_mode=spatial_padding_mode)
-        self.use_shortcut_conv = in_channels != out_channels
-        if self.use_shortcut_conv:
-            self.conv_shortcut = CausalConv3d(in_channels, out_channels, kernel_size=1,
-                                              causal=causal, spatial_padding_mode=spatial_padding_mode)
+        self.use_shortcut = in_channels != out_channels
+        if self.use_shortcut:
+            # PT uses LayerNorm + make_linear_nd (1×1×1 Conv3d, no causal)
             self.norm3 = nn.LayerNorm(in_channels, eps=1e-6)
+            self.conv_shortcut = PlainConv3d(in_channels, out_channels)
 
     def __call__(self, x: mx.array) -> mx.array:
         h = self.norm1(x)
@@ -151,52 +195,62 @@ class ResnetBlock3D(nn.Module):
         h = self.norm2(h)
         h = self.act(h)
         h = self.conv2(h)
-        if self.use_shortcut_conv:
+        if self.use_shortcut:
             x = self.norm3(x)
             x = self.conv_shortcut(x)
         return x + h
 
 
-# =============================================================================
-# Upsample / Downsample
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# DepthToSpaceUpsample (matches PT DepthToSpaceUpsample without residual)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-class Upsample3D(nn.Module):
-    """Depth-to-space (pixel shuffle) 2x upsampling + Conv3d — NHWC native.
-
-    The conv outputs 8x channels (2x per T,H,W dim), then depth-to-space
-    rearranges them into spatial dimensions.
+class DepthToSpaceUpsample(nn.Module):
+    """
+    PT DepthToSpaceUpsample (non-residual mode):
+      conv: CausalConv3d(in, in*8, 3, stride=1)
+      depth-to-space: (B, T*2, H*2, W*2, C)
+      if stride_t==2: remove first temporal frame
     """
 
-    def __init__(self, channels: int, spatial_padding_mode: str = "replicate"):
+    def __init__(self, channels: int, spatial_padding_mode: str = "zeros",
+                 causal: bool = True):
         super().__init__()
-        # Conv outputs 8x channels for 2x depth-to-space in T, H, W
-        self.conv = CausalConv3d(channels, channels * 8, kernel_size=3, causal=False,
-                                  spatial_padding_mode=spatial_padding_mode)
+        self.conv = CausalConv3d(channels, channels * 8, kernel_size=3,
+                                  causal=causal, spatial_padding_mode=spatial_padding_mode)
         self.channels = channels
 
     def __call__(self, x: mx.array) -> mx.array:
-        """x: (N, T, H, W, C) NHWC → (N, T*2-1, H*2, W*2, C) NHWC"""
-        x = self.conv(x)  # (N, T, H, W, C*8)
+        """x: (N, T, H, W, C) NHWC → (N, T*2-1, H*2, W*2, C) NHWC
 
-        N, T, H, W, C8 = x.shape
-        C = C8 // 8
-        # Depth-to-space in NHWC
-        # (N, T, H, W, 2(p_T), 2(p_H), 2(p_W), C)
-        x = mx.reshape(x, (N, T, H, W, 2, 2, 2, C))
-        # Transpose: (N, T, p_T, H, p_H, W, p_W, C)
-        x = mx.transpose(x, (0, 1, 4, 2, 5, 3, 6, 7))
-        # (N, T*2, H*2, W*2, C)
+        PT: rearrange(x, "b (c p1 p2 p3) d h w -> b c (d p1) (h p2) (w p3)")
+        The 4096 channels are grouped as (C=512, pT=2, pH=2, pW=2) where
+        C varies slowest (index // 8), pW varies fastest (index % 2).
+        In NHWC reshape terms: (N, T, H, W, C, pT, pH, pW) — C before the
+        pixel dimensions so C varies slowest in the flattened axis.
+        """
+        N, T, H, W, C = x.shape
+        x = self.conv(x)  # (N, T, H, W, channels*8)
+
+        # conv output channels: (C, pT, pH, pW) — C slowest, pW fastest
+        x = mx.reshape(x, (N, T, H, W, C, 2, 2, 2))  # (N,T,H,W, C,pT,pH,pW)
+        # → (N, T, pT, H, pH, W, pW, C)
+        x = mx.transpose(x, (0, 1, 5, 2, 6, 3, 7, 4))
+        # → (N, T*2, H*2, W*2, C)  — (T,pT) flattened: T slower, pT faster → t*2+pt ✓
         x = mx.reshape(x, (N, T * 2, H * 2, W * 2, C))
-        # Remove duplicated first temporal frame (compensation for encoder causal pad)
+
+        # Remove first temporal frame (stride_t==2 compensation)
         x = x[:, 1:, :, :, :]
         return x
 
 
-class Downsample3D(nn.Module):
-    """Strided CausalConv3d for 2x downsampling."""
+# ═══════════════════════════════════════════════════════════════════════════════
+# Strided downsampler (compress_all)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    def __init__(self, channels: int, spatial_padding_mode: str = "replicate"):
+class Downsample3D(nn.Module):
+    """PT compress_all: CausalConv3d with stride=(2,2,2)."""
+    def __init__(self, channels: int, spatial_padding_mode: str = "zeros"):
         super().__init__()
         self.conv = CausalConv3d(channels, channels, kernel_size=3,
                                   stride=(2, 2, 2), causal=True,
@@ -206,26 +260,26 @@ class Downsample3D(nn.Module):
         return self.conv(x)
 
 
-# =============================================================================
-# Patchify / Unpatchify (NHWC)
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Patchify / Unpatchify (NHWC, spatial-only)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def patchify_nhwc(x: mx.array, patch_size: int = 4) -> mx.array:
     """
-    Fold spatial patches into channels. NHWC format.
-    (N, T, H, W, C) → (N, T, H/p, W/p, C * p^2)
-    Example: (1, 33, 512, 512, 3) → (1, 33, 128, 128, 48)  [3*4*4=48]
+    PT patchify(patch_size_hw=4, patch_size_t=1):
+      PT channel order: new_c = c*p^2 + (w%p)*p + (h%p)
+      i.e. C is slowest-varying, W_patch is middle, H_patch is fastest.
+      (N, T, H, W, C) → (N, T, H/p, W/p, C * p^2)
+
+    We flatten (C, pW, pH) in C-slowest order to match PT.
     """
     if patch_size == 1:
         return x
     N, T, H, W, C = x.shape
     p = patch_size
-    # (N, T, H/p, p, W/p, p, C)
+    # (N, T, H/p, pH, W/p, pW, C) → (N, T, H/p, W/p, C, pW, pH) → flatten last 3
     x = mx.reshape(x, (N, T, H // p, p, W // p, p, C))
-    # Transpose: bring p's together with C
-    # (N, T, H/p, W/p, p, p, C)
-    x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))
-    # (N, T, H/p, W/p, p * p * C)
+    x = mx.transpose(x, (0, 1, 2, 4, 6, 5, 3))  # → (N, T, H/p, W/p, C, pW, pH)
     x = mx.reshape(x, (N, T, H // p, W // p, p * p * C))
     return x
 
@@ -233,78 +287,27 @@ def patchify_nhwc(x: mx.array, patch_size: int = 4) -> mx.array:
 def unpatchify_nhwc(x: mx.array, patch_size: int = 4,
                     out_channels: int = 3) -> mx.array:
     """
-    Reverse of patchify_nhwc.
-    (N, T, H_s, W_s, C*p^2) → (N, T, H_s*p, W_s*p, C)
+    PT unpatchify(patch_size_hw=4, patch_size_t=1):
+      Reverse of patchify_nhwc.
+      (N, T, H_s, W_s, C*p^2) → (N, T, H, W, C)
     """
     if patch_size == 1:
         return x
-    N, T, H_s, W_s, C_big = x.shape
+    N, T, H_s, W_s = x.shape[0], x.shape[1], x.shape[2], x.shape[3]
     p = patch_size
-    # Keep only the needed output channels
     needed_c = out_channels * p * p
     x = x[:, :, :, :, :needed_c]
-    # (N, T, H_s, W_s, p, p, out_c)
-    x = mx.reshape(x, (N, T, H_s, W_s, p, p, out_channels))
-    # Transpose: (N, T, H_s, p, W_s, p, out_c)
-    x = mx.transpose(x, (0, 1, 2, 4, 3, 5, 6))
-    # (N, T, H, W, out_c)
+    # (N, T, H_s, W_s, C, pW, pH) → (N, T, H_s, pH, W_s, pW, C) → (N, T, H, W, C)
+    x = mx.reshape(x, (N, T, H_s, W_s, out_channels, p, p))
+    x = mx.transpose(x, (0, 1, 2, 6, 3, 5, 4))  # (N, T, H_s, pH, W_s, pW, C)
     x = mx.reshape(x, (N, T, H_s * p, W_s * p, out_channels))
     return x
 
 
-# =============================================================================
-# Attention Block (NHWC)
-# =============================================================================
-
-class AttentionBlock(nn.Module):
-    """Single-head spatial self-attention. NHWC native."""
-
-    def __init__(self, channels: int):
-        super().__init__()
-        self.norm = PixelNorm()
-        self.to_qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-        self.channels = channels
-
-    def __call__(self, x: mx.array) -> mx.array:
-        """
-        x: (N, T, H, W, C) NHWC
-        Attention applied on H*W spatial dims, independently per frame.
-        """
-        N, T, H, W, C = x.shape
-        identity = x
-
-        # Reshape to (N*T, H, W, C) for 2D conv (MLX Conv2d also expects NHWC)
-        x_2d = mx.reshape(x, (N * T, H, W, C))
-        x_2d = self.norm(x_2d)
-
-        # QKV projection (output: N*T, H, W, 3C)
-        qkv = self.to_qkv(x_2d)
-        qkv = mx.reshape(qkv, (N * T, H * W, 3, C))
-        q = qkv[:, :, 0, :]  # (N*T, H*W, C)
-        k = qkv[:, :, 1, :]
-        v = qkv[:, :, 2, :]
-
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(C)
-        scores = mx.matmul(q, mx.transpose(k, (0, 2, 1))) * scale
-        attn = mx.softmax(scores, axis=-1)
-        out = mx.matmul(attn, v)  # (N*T, H*W, C)
-
-        # Reshape back
-        out = mx.reshape(out, (N * T, H, W, C))
-        out = self.proj(out)  # Conv2d expects NHWC
-        out = mx.reshape(out, (N, T, H, W, C))
-
-        return out + identity
-
-
-# =============================================================================
-# Weight conversion
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════════
+# Weight conversion: PT NCDHW → MLX NHWC
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def pt_to_mlx_conv3d(pt_weight: mx.array) -> mx.array:
-    """
-    PyTorch Conv3d (out, in, kT, kH, kW) → MLX (out, kT, kH, kW, in).
-    """
+    """PyTorch Conv3d (out, in, kT, kH, kW) → MLX (out, kT, kH, kW, in)."""
     return mx.transpose(pt_weight, (0, 2, 3, 4, 1))
