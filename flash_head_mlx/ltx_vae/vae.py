@@ -195,8 +195,16 @@ class CausalVideoAutoencoder(nn.Module):
 # Weight Loader — maps diffusers key paths to MLX model attributes
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def load_weights_from_safetensors(model: CausalVideoAutoencoder, path: str):
-    """Load diffusers-format safetensors into MLX VAE."""
+def load_weights_from_safetensors(model: CausalVideoAutoencoder, path: str,
+                                   dtype: Optional[mx.Dtype] = None):
+    """Load diffusers-format safetensors into MLX VAE.
+
+    Args:
+        model: CausalVideoAutoencoder instance
+        path: path to diffusion_pytorch_model.safetensors
+        dtype: optional target dtype (e.g. mx.float16 for faster inference).
+               If None, uses the original float32 precision.
+    """
     import safetensors
 
     with safetensors.safe_open(path, framework="np") as f:
@@ -210,6 +218,8 @@ def load_weights_from_safetensors(model: CausalVideoAutoencoder, path: str):
             weight = mx.array(f.get_tensor(key))
             if weight.ndim == 5 and 'weight' in key:
                 weight = pt_to_mlx_conv3d(weight)
+            if dtype is not None and weight.dtype != dtype:
+                weight = weight.astype(dtype)
             if _set_weight(model, key, weight):
                 loaded += 1
             else:
@@ -219,8 +229,12 @@ def load_weights_from_safetensors(model: CausalVideoAutoencoder, path: str):
     with safetensors.safe_open(path, framework="np") as f:
         if 'latents_mean' in f.keys():
             model.mean_of_means = mx.array(f.get_tensor('latents_mean'))
+            if dtype is not None:
+                model.mean_of_means = model.mean_of_means.astype(dtype)
         if 'latents_std' in f.keys():
             model.std_of_means = mx.array(f.get_tensor('latents_std'))
+            if dtype is not None:
+                model.std_of_means = model.std_of_means.astype(dtype)
 
     print(f'Loaded {loaded}/{len(keys)} weight tensors from {path}')
     if skipped:
@@ -379,15 +393,26 @@ def _set_conv_weight(obj, parts, idx, weight):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LtxVAE:
-    """MLX VAE — same API as PyTorch version."""
+    """MLX VAE — same API as PyTorch version.
 
-    def __init__(self, safetensors_path: str = None):
+    Args:
+        safetensors_path: path to diffusion_pytorch_model.safetensors
+        dtype: optional mlx dtype (e.g. mx.float16 for ~2x faster inference).
+               Defaults to mx.float32 for maximum precision.
+    """
+
+    def __init__(self, safetensors_path: str = None, dtype=None):
         self.model = CausalVideoAutoencoder()
+        self.dtype = dtype
         if safetensors_path is not None:
-            load_weights_from_safetensors(self.model, safetensors_path)
+            load_weights_from_safetensors(self.model, safetensors_path, dtype=dtype)
 
     def encode(self, video: mx.array) -> mx.array:
+        if self.dtype is not None and video.dtype != self.dtype:
+            video = video.astype(self.dtype)
         return self.model.encode(video)
 
     def decode(self, zs: mx.array) -> mx.array:
+        if self.dtype is not None and zs.dtype != self.dtype:
+            zs = zs.astype(self.dtype)
         return self.model.decode(zs)
